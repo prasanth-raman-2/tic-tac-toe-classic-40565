@@ -1,5 +1,61 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
+
+/**
+ * Fetches commentary from OpenAI based on game state and latest move.
+ * Uses environment variable for OPENAI_API_KEY (must be injected at build time!).
+ * Handles errors and returns commentary (or error string).
+ * @param {Array<Array>} board - 3x3 Array representing board.
+ * @param {'X'|'O'} player - The player who just made the move
+ * @param {Array} move - [row, col] of last move
+ * @returns {Promise<string>} commentary
+ */
+async function fetchOpenAICommentary(board, player, move) {
+  const apiKey = process.env.REACT_APP_OPENAI_API_KEY;
+  if (!apiKey) {
+    return "Commentator unavailable (API key missing).";
+  }
+
+  // Prepare board as nice string for prompt
+  const boardStr = board.map(row => row.map(c => c || "_").join(" ")).join("\n");
+  const moveStr = move ? `Row ${move[0] + 1}, Column ${move[1] + 1}` : "N/A";
+
+  // Prompt to explain game state, latest move, and description requirement
+  const prompt = `
+You are a witty sports commentator summarizing a Tic Tac Toe game for an audience. The current state of the game is:
+${boardStr}
+The most recent move was by ${player} at ${moveStr}.
+Briefly describe the significance of this move and the game's state in 1-2 sentences. If someone is close to winning or a draw is near, mention it!
+`;
+
+  try {
+    // Use fetch so it's compatible in browser (no Node.js openai SDK)
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + apiKey
+      },
+      body: JSON.stringify({
+        model: "gpt-3.5-turbo",
+        messages: [{role: "user", content: prompt}],
+        max_tokens: 50,
+        temperature: 0.8
+      })
+    });
+    if (!response.ok) {
+      throw new Error("OpenAI API error");
+    }
+    const data = await response.json();
+    if (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) {
+      return data.choices[0].message.content.trim();
+    } else {
+      return "Commentator: (No commentary returned.)";
+    }
+  } catch (err) {
+    return "Commentator error: Unable to contact OpenAI.";
+  }
+}
 
 /**
  * A square on the tic tac toe board.
@@ -43,7 +99,9 @@ function Board({ squares, onSquareClick, disabled }) {
   );
 }
 
-// PUBLIC_INTERFACE
+/**
+ * The main Tic Tac Toe App with OpenAI-based commentator.
+ */
 function App() {
   // --- Game State Management ---
   const initialBoard = [
@@ -52,16 +110,21 @@ function App() {
     ['', '', '']
   ];
 
-  // X always goes first
+  // Board state & turn info
   const [board, setBoard] = useState(initialBoard);
   const [xIsNext, setXIsNext] = useState(true);
   const [winner, setWinner] = useState(null);
   const [moveCount, setMoveCount] = useState(0);
 
+  // --- Commentator State ---
+  const [commentary, setCommentary] = useState("");     // Commentary for display
+  const [isLoading, setIsLoading] = useState(false);    // For loading spinner/status
+  const lastMoveRef = useRef(null);                     // Store last move details for api
+
   // Theme control (light/dark)
   const [theme, setTheme] = useState('light');
 
-  // Effect to sync theme with document
+  // Sync theme with document
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
@@ -71,13 +134,37 @@ function App() {
     setTheme(prev => (prev === 'light' ? 'dark' : 'light'));
   };
 
-  // Calculate winner every move
+  // Calculate winner every move and trigger commentary if there was a move
   useEffect(() => {
     const result = calculateWinner(board);
     setWinner(result);
+
+    // Only send to commentator if there was a move (not on reset/initial mount)
+    if (lastMoveRef.current && !result) {
+      setIsLoading(true);
+      setCommentary(""); // Clear previous
+      const player = !xIsNext ? "X" : "O"; // Because state was just flipped
+      fetchOpenAICommentary(board, player, lastMoveRef.current)
+        .then(msg => setCommentary(msg))
+        .catch(() => setCommentary("Commentator: Error getting commentary."))
+        .finally(() => setIsLoading(false));
+    } else if (result && lastMoveRef.current) {
+      // Game ended, give a final commentary
+      setIsLoading(true);
+      // Winner could be 'Draw' or 'X' or 'O'
+      const player = !xIsNext ? "X" : "O";
+      fetchOpenAICommentary(board, player, lastMoveRef.current)
+        .then(msg => setCommentary(msg + " [Game Over]"))
+        .catch(() => setCommentary("Commentator: Error getting commentary."))
+        .finally(() => setIsLoading(false));
+    } else if (!lastMoveRef.current) {
+      setCommentary("");
+      setIsLoading(false);
+    }
+    // eslint-disable-next-line
   }, [board]);
 
-  // Handle square press
+  // Called when a board square is clicked
   function handleSquareClick(row, col) {
     if (winner || board[row][col] !== '') return;
     const current = board.map(r => r.slice());
@@ -85,6 +172,7 @@ function App() {
     setBoard(current);
     setXIsNext(!xIsNext);
     setMoveCount(moveCount + 1);
+    lastMoveRef.current = [row, col];
   }
 
   // Handle reset
@@ -93,6 +181,9 @@ function App() {
     setXIsNext(true);
     setWinner(null);
     setMoveCount(0);
+    setCommentary("");
+    setIsLoading(false);
+    lastMoveRef.current = null;
   }
 
   // Calculate game status message
@@ -132,6 +223,25 @@ function App() {
           onSquareClick={handleSquareClick}
           disabled={!!winner}
         />
+        {/* Commentator section */}
+        <div
+          className="ttt-commentator"
+          style={{
+            minHeight: '2.7rem',
+            margin: "1.5rem auto 0 auto",
+            width: "100%",
+            textAlign: "center",
+            color: "var(--ttt-primary)",
+            fontStyle: "italic",
+            fontWeight: 500,
+            fontSize: "1.11rem"
+          }}
+        >
+          {isLoading
+            ? <span style={{color: 'gray'}}>Commentator: Thinking...</span>
+            : commentary && <span>{commentary}</span>
+          }
+        </div>
         <button
           className="ttt-reset-btn"
           onClick={handleReset}
